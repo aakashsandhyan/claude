@@ -9,9 +9,12 @@
 # Requires: jq
 #
 # Env:
-#   CLAUDE_CACHE_TTL   cache TTL in seconds (default 3600; use 300 for the 5m tier)
+#   CLAUDE_CACHE_TTL   cache TTL in seconds (default 3600; use 300 for the 5m
+#                      tier). Only tints the idle figure: yellow past 3/4 of the
+#                      TTL, red once the cache has expired.
 #   BAR_WIDTH          context bar width in chars (default 10)
 #   NO_COLOR           set to any value to disable ANSI colour
+#   STATUSLINE_COLS    force a width in columns (overrides auto-detect)
 #
 # Idle time is derived from the transcript file's mtime, since the statusLine
 # JSON carries no last-interaction timestamp. Two known limits:
@@ -20,6 +23,10 @@
 #     next turn.
 #   - mtime marks the end of a turn, while the cache clock starts at the
 #     request's beginning. Negligible against a 1h TTL, material against 5m.
+#
+# Segments wrap onto extra lines when the terminal is too narrow. Because the
+# status line only re-renders on conversation activity, a resize does not
+# reflow until your next turn.
 
 input=$(cat)
 
@@ -31,9 +38,10 @@ CWD=$(jq -r '.workspace.current_dir // .cwd // "."' <<< "$input")
 DIR=$(basename "$CWD")
 TRANSCRIPT=$(jq -r '.transcript_path // ""' <<< "$input")
 
-# --no-optional-locks keeps this read-only, so it cannot contend for
-# .git/index.lock on a render path. Short SHA on detached HEAD; nothing
-# outside a repo.
+# --- git branch --------------------------------------------------------------
+# --no-optional-locks keeps this read-only, so it cannot fight Claude Code or
+# your shell over .git/index.lock. Falls back to a short SHA on detached HEAD,
+# and to nothing at all outside a repo.
 LOC="$DIR"
 if BRANCH=$(git -C "$CWD" --no-optional-locks branch --show-current 2>/dev/null); then
   if [[ -z "$BRANCH" ]]; then
@@ -87,9 +95,12 @@ if [[ "$PCT" != "-" ]]; then
     C=""; R=""
   fi
   CTX="${C}${BAR} ${P}%${R}"
-  [[ "$TOK" != "-" ]] && CTX+=" $(human "$TOK")"
+  CTX_W=$(( BAR_WIDTH + ${#P} + 2 ))          # bar + space + "NN" + "%"
+  if [[ "$TOK" != "-" ]]; then
+    H=$(human "$TOK"); CTX+=" $H"; CTX_W=$(( CTX_W + ${#H} + 1 ))
+  fi
 else
-  CTX="ctx ?"
+  CTX="ctx ?"; CTX_W=5
 fi
 
 # --- idle + cache ------------------------------------------------------------
@@ -101,15 +112,46 @@ if [[ -n "${LAST:-}" ]]; then
   AGE=$(( $(date +%s) - LAST ))
   (( AGE < 0 )) && AGE=0          # future mtime: clock skew, NFS, VM drift
   IDLE=$(printf '%dm%02ds' $(( AGE / 60 )) $(( AGE % 60 )))
-  if (( AGE < TTL )); then
-    LEFT=$(( TTL - AGE ))
-    if (( LEFT >= 60 )); then CACHE=$(printf 'warm %dm' $(( LEFT / 60 )))
-    else                      CACHE=$(printf 'warm %ds' "$LEFT"); fi
-  else
-    CACHE="cold"
+  IDLE_PLAIN="$IDLE"
+  # Colour carries the cache boundary, so it needs no segment of its own.
+  if [[ -z "${NO_COLOR:-}" ]]; then
+    if (( AGE >= TTL )); then IDLE=$'\033[31m'"$IDLE"$'\033[0m'        # cold
+    elif (( AGE >= TTL * 3 / 4 )); then IDLE=$'\033[33m'"$IDLE"$'\033[0m'  # expiring
+    fi
   fi
 else
-  IDLE="?"; CACHE="?"
+  IDLE="?"; IDLE_PLAIN="?"
 fi
+IDLE_W=$(( ${#IDLE_PLAIN} + 5 ))   # "idle " + text; measured before colouring
 
-printf '[%s] %s · %s · idle %s · cache %s' "$MODEL" "$LOC" "$CTX" "$IDLE" "$CACHE"
+# --- layout ------------------------------------------------------------------
+# stdout is a pipe, so `tput cols` reports terminfo's default rather than the
+# real window. /dev/tty is the only source of the actual size.
+if [[ -n "${STATUSLINE_COLS:-}" ]]; then
+  COLS="$STATUSLINE_COLS"
+else
+  COLS=$(stty size </dev/tty 2>/dev/null | cut -d" " -f2)
+  [[ "$COLS" =~ ^[0-9]+$ ]] || COLS=$(tput cols 2>/dev/null)
+  [[ "$COLS" =~ ^[0-9]+$ ]] || COLS="${COLUMNS:-80}"
+fi
+(( COLS -= 2 ))                       # margin for padding / edge glyphs
+(( COLS < 20 )) && COLS=20
+
+# Parallel arrays: rendered segment, and its display width. Widths are computed
+# rather than measured, because ${#s} counts bytes in a non-UTF-8 locale and the
+# bar glyphs are 3 bytes each.
+SEGS=(  "[$MODEL] $LOC"        "$CTX"   "idle $IDLE"  )
+WIDTH=( $(( ${#MODEL} + ${#LOC} + 3 )) "$CTX_W" "$IDLE_W" )
+
+LINE=""; LW=0; OUT=""
+for i in "${!SEGS[@]}"; do
+  w=${WIDTH[$i]}
+  if (( LW == 0 )); then
+    LINE="${SEGS[$i]}"; LW=$w
+  elif (( LW + 3 + w <= COLS )); then
+    LINE+=" · ${SEGS[$i]}"; LW=$(( LW + 3 + w ))
+  else
+    OUT+="$LINE"$'\n'; LINE="${SEGS[$i]}"; LW=$w
+  fi
+done
+printf '%s%s' "$OUT" "$LINE"
