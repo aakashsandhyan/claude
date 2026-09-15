@@ -1,157 +1,113 @@
 #!/bin/bash
-# Claude Code status line: model, dir, context bar, idle time, prompt-cache warmth.
+# Claude Code status line, three fixed lines:
+#
+#   [Opus] bahikhaata (main)
+#   ██████░░░░ 68% 136k
+#   cache warm 47:18 · 1h · hit 91%
 #
 # Install:
 #   chmod +x statusline.sh && cp statusline.sh ~/.claude/statusline.sh
 #   # ~/.claude/settings.json:
-#   { "statusLine": { "type": "command", "command": "~/.claude/statusline.sh", "padding": 0 } }
+#   { "statusLine": { "type": "command", "command": "bash ~/.claude/statusline.sh",
+#                     "padding": 0, "refreshInterval": 1 } }
 #
-# Requires: jq
+# refreshInterval (>= 2.1.97) is what makes the countdown tick; without it the
+# status line only re-renders on conversation events. Claude Code also re-runs
+# the command when a warm cache reaches its expires_at, so the cold transition
+# shows up even with refreshInterval unset.
+#
+# Requires: jq. Cache fields require Claude Code >= 2.1.251
+# (last_miss_cause >= 2.1.260); the cache line degrades to "cache -" below that.
 #
 # Env:
-#   CLAUDE_CACHE_TTL   cache TTL in seconds (default 3600; use 300 for the 5m
-#                      tier). Only tints the idle figure: yellow past 3/4 of the
-#                      TTL, red once the cache has expired.
-#   BAR_WIDTH          context bar width in chars (default 10)
-#   NO_COLOR           set to any value to disable ANSI colour
-#   STATUSLINE_COLS    force a width in columns (overrides auto-detect)
-#
-# Idle time is derived from the transcript file's mtime, since the statusLine
-# JSON carries no last-interaction timestamp. Two known limits:
-#   - The status line re-renders on conversation activity, not on a timer, so
-#     the idle counter does not tick while you are away; it corrects on the
-#     next turn.
-#   - mtime marks the end of a turn, while the cache clock starts at the
-#     request's beginning. Negligible against a 1h TTL, material against 5m.
-#
-# Segments wrap onto extra lines when the terminal is too narrow. Because the
-# status line only re-renders on conversation activity, a resize does not
-# reflow until your next turn.
+#   BAR_WIDTH   context bar width in chars (default 10)
+#   NO_COLOR    set to any value to disable ANSI colour
 
 input=$(cat)
-
-TTL="${CLAUDE_CACHE_TTL:-3600}"
 BAR_WIDTH="${BAR_WIDTH:-10}"
 
-MODEL=$(jq -r '.model.display_name // "?"' <<< "$input")
-CWD=$(jq -r '.workspace.current_dir // .cwd // "."' <<< "$input")
+# One jq call: at refreshInterval 1 the ~2.5ms process spawn dominates this
+# script. Tab-separated so paths containing spaces survive the read.
+IFS=$'\t' read -r MODEL CWD PCT TOK CWARM CTTL CEXP CHIT CMISS < <(jq -Rsr '
+  (fromjson? // {})                                                      as $j
+  | ($j.context_window // {})                                            as $c
+  | ($c.current_usage // {})                                             as $u
+  | (($u.input_tokens // 0) + ($u.cache_creation_input_tokens // 0)
+     + ($u.cache_read_input_tokens // 0))                                as $usum
+  | ($c.total_input_tokens // (if $usum > 0 then $usum else null end))    as $tok
+  | ($c.context_window_size // null)                                     as $win
+  | ($c.used_percentage //
+     (if ($tok != null and $win != null and $win > 0)
+      then ($tok / $win * 100) else null end))                           as $pct
+  | ($j.prompt_cache // {})                                              as $p
+  | [ ($j.model.display_name // "?"),
+      ($j.workspace.current_dir // $j.cwd // "."),
+      ($pct // "-"), ($tok // "-"),
+      (if $p.warm == null then "-" else ($p.warm|tostring) end),
+      ($p.ttl // "-"),
+      ($p.expires_at // "-"),
+      (if $p.hit_ratio == null then "-" else (($p.hit_ratio * 100)|floor|tostring) end),
+      (($p.last_miss_cause.causes // []) | join(",") | if . == "" then "-" else . end)
+    ] | @tsv
+' <<< "$input")
 DIR=$(basename "$CWD")
-TRANSCRIPT=$(jq -r '.transcript_path // ""' <<< "$input")
 
-# --- git branch --------------------------------------------------------------
-# --no-optional-locks keeps this read-only, so it cannot fight Claude Code or
-# your shell over .git/index.lock. Falls back to a short SHA on detached HEAD,
-# and to nothing at all outside a repo.
+human() { local n=$1
+  if   [[ ! "$n" =~ ^[0-9]+$ ]]; then printf -- '-'
+  elif (( n >= 1000000 )); then printf '%dM' $(( n / 1000000 ))
+  elif (( n >= 1000 ));    then printf '%dk' $(( n / 1000 ))
+  else printf '%d' "$n"; fi; }
+
+col() { [[ -n "${NO_COLOR:-}" ]] && printf '%s' "$2" || printf '\033[%sm%s\033[0m' "$1" "$2"; }
+
+# --- line 1: model, dir, branch ----------------------------------------------
+# --no-optional-locks keeps this read-only so it cannot contend for
+# .git/index.lock on a render path. -C "$CWD" matters: the docs' examples rely
+# on the script's own cwd, which is not guaranteed to be the session directory.
 LOC="$DIR"
 if BRANCH=$(git -C "$CWD" --no-optional-locks branch --show-current 2>/dev/null); then
-  if [[ -z "$BRANCH" ]]; then
-    SHA=$(git -C "$CWD" --no-optional-locks rev-parse --short HEAD 2>/dev/null)
-    [[ -n "$SHA" ]] && BRANCH="@$SHA"
-  fi
+  [[ -z "$BRANCH" ]] && { SHA=$(git -C "$CWD" --no-optional-locks rev-parse --short HEAD 2>/dev/null); [[ -n "$SHA" ]] && BRANCH="@$SHA"; }
   [[ -n "$BRANCH" ]] && LOC="$DIR ($BRANCH)"
 fi
 
-# --- context -----------------------------------------------------------------
-# Field layout has varied across Claude Code versions. Prefer the server-computed
-# used_percentage; fall back to total_input_tokens, then to summing the
-# current_usage subtotals, then give up rather than printing a wrong number.
-read -r PCT TOK WIN < <(jq -r '
-  (.context_window // {})                                              as $c
-  | ($c.current_usage // {})                                           as $u
-  | (if ($u|type) == "object" then ([$u[] | numbers] | add) else $u end) as $usum
-  | ($c.total_input_tokens // $usum)                                   as $tok
-  | ($c.context_window_size // null)                                   as $win
-  | ($c.used_percentage //
-     (if ($tok != null and $win != null and $win > 0)
-      then ($tok / $win * 100) else null end))                         as $pct
-  | [ ($pct // "-"), ($tok // "-"), ($win // "-") ] | @tsv
-' <<< "$input")
-
-human() { # 15420 -> 15k
-  local n=$1
-  if   [[ "$n" == "-" ]]; then printf -- '-'
-  elif (( n >= 1000000 )); then printf '%dM' $(( n / 1000000 ))
-  elif (( n >= 1000 ));    then printf '%dk' $(( n / 1000 ))
-  else printf '%d' "$n"; fi
-}
-
+# --- line 2: context bar -----------------------------------------------------
+# used_percentage counts input only (input + cache_creation + cache_read), never
+# output_tokens -- the manual fallback above uses the same formula so the two
+# agree instead of drifting apart.
 if [[ "$PCT" != "-" ]]; then
-  P=$(printf '%.0f' "$PCT")
-  (( P < 0 )) && P=0
-  (( P > 100 )) && P=100
-  FILLED=$(( P * BAR_WIDTH / 100 ))
-  BAR=""
-  for (( i = 0; i < BAR_WIDTH; i++ )); do
-    if (( i < FILLED )); then BAR+="█"; else BAR+="░"; fi
-  done
+  P=$(printf '%.0f' "$PCT"); (( P < 0 )) && P=0; (( P > 100 )) && P=100
+  FILLED=$(( P * BAR_WIDTH / 100 )); BAR=""
+  for (( i = 0; i < BAR_WIDTH; i++ )); do (( i < FILLED )) && BAR+="█" || BAR+="░"; done
+  if   (( P >= 90 )); then BC=31; elif (( P >= 70 )); then BC=33; else BC=32; fi
+  CTX="$(col $BC "$BAR $P%")"
+  [[ "$TOK" != "-" ]] && CTX+=" $(human "$TOK")"
+else
+  CTX="ctx ?"
+fi
 
-  if [[ -z "${NO_COLOR:-}" ]]; then
-    if   (( P >= 90 )); then C=$'\033[31m'   # red
-    elif (( P >= 70 )); then C=$'\033[33m'   # yellow
-    else                     C=$'\033[32m'   # green
-    fi
-    R=$'\033[0m'
+# --- line 3: prompt cache ----------------------------------------------------
+# Straight from the statusLine payload -- Claude Code computes these from the
+# API's cache token counts, so there is no transcript to parse and no guessing
+# from idle time.
+if [[ "$CWARM" == "true" && "$CEXP" =~ ^[0-9]+$ ]]; then
+  R=$(( CEXP - $(date +%s) ))
+  if (( R > 0 )); then
+    if   (( R <= 300 )); then WC=31; elif (( R <= 900 )); then WC=33; else WC=32; fi
+    LINE3="$(col $WC "$(printf 'cache warm %d:%02d' $(( R / 60 )) $(( R % 60 )))")"
   else
-    C=""; R=""
+    LINE3="$(col 31 'cache expiring')"
   fi
-  CTX="${C}${BAR} ${P}%${R}"
-  CTX_W=$(( BAR_WIDTH + ${#P} + 2 ))          # bar + space + "NN" + "%"
-  if [[ "$TOK" != "-" ]]; then
-    H=$(human "$TOK"); CTX+=" $H"; CTX_W=$(( CTX_W + ${#H} + 1 ))
-  fi
+  [[ "$CTTL"  != "-" ]] && LINE3+=" · $CTTL"
+  [[ "$CHIT"  != "-" ]] && LINE3+=" · hit ${CHIT}%"
+elif [[ "$CWARM" == "false" ]]; then
+  LINE3="$(col 31 'cache cold')"
+  [[ "$CHIT"  != "-" ]] && LINE3+=" · hit ${CHIT}%"
+  # Why the last miss happened: tools_changed, system_prompt_changed,
+  # ttl_expired_5m, likely_server_side. A non-TTL cause means the prefix moved,
+  # which no amount of returning sooner would have fixed.
+  [[ "$CMISS" != "-" ]] && LINE3+=" · $(col 33 "$CMISS")"
 else
-  CTX="ctx ?"; CTX_W=5
+  LINE3="cache -"
 fi
 
-# --- idle + cache ------------------------------------------------------------
-if [[ -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]]; then
-  LAST=$(stat -c %Y "$TRANSCRIPT" 2>/dev/null || stat -f %m "$TRANSCRIPT" 2>/dev/null)
-fi
-
-if [[ -n "${LAST:-}" ]]; then
-  AGE=$(( $(date +%s) - LAST ))
-  (( AGE < 0 )) && AGE=0          # future mtime: clock skew, NFS, VM drift
-  IDLE=$(printf '%dm%02ds' $(( AGE / 60 )) $(( AGE % 60 )))
-  IDLE_PLAIN="$IDLE"
-  # Colour carries the cache boundary, so it needs no segment of its own.
-  if [[ -z "${NO_COLOR:-}" ]]; then
-    if (( AGE >= TTL )); then IDLE=$'\033[31m'"$IDLE"$'\033[0m'        # cold
-    elif (( AGE >= TTL * 3 / 4 )); then IDLE=$'\033[33m'"$IDLE"$'\033[0m'  # expiring
-    fi
-  fi
-else
-  IDLE="?"; IDLE_PLAIN="?"
-fi
-IDLE_W=$(( ${#IDLE_PLAIN} + 5 ))   # "idle " + text; measured before colouring
-
-# --- layout ------------------------------------------------------------------
-# stdout is a pipe, so `tput cols` reports terminfo's default rather than the
-# real window. /dev/tty is the only source of the actual size.
-if [[ -n "${STATUSLINE_COLS:-}" ]]; then
-  COLS="$STATUSLINE_COLS"
-else
-  COLS=$(stty size </dev/tty 2>/dev/null | cut -d" " -f2)
-  [[ "$COLS" =~ ^[0-9]+$ ]] || COLS=$(tput cols 2>/dev/null)
-  [[ "$COLS" =~ ^[0-9]+$ ]] || COLS="${COLUMNS:-80}"
-fi
-(( COLS -= 2 ))                       # margin for padding / edge glyphs
-(( COLS < 20 )) && COLS=20
-
-# Parallel arrays: rendered segment, and its display width. Widths are computed
-# rather than measured, because ${#s} counts bytes in a non-UTF-8 locale and the
-# bar glyphs are 3 bytes each.
-SEGS=(  "[$MODEL] $LOC"        "$CTX"   "idle $IDLE"  )
-WIDTH=( $(( ${#MODEL} + ${#LOC} + 3 )) "$CTX_W" "$IDLE_W" )
-
-LINE=""; LW=0; OUT=""
-for i in "${!SEGS[@]}"; do
-  w=${WIDTH[$i]}
-  if (( LW == 0 )); then
-    LINE="${SEGS[$i]}"; LW=$w
-  elif (( LW + 3 + w <= COLS )); then
-    LINE+=" · ${SEGS[$i]}"; LW=$(( LW + 3 + w ))
-  else
-    OUT+="$LINE"$'\n'; LINE="${SEGS[$i]}"; LW=$w
-  fi
-done
-printf '%s%s' "$OUT" "$LINE"
+printf '[%s] %s\n%s\n%s' "$MODEL" "$LOC" "$CTX" "$LINE3"
