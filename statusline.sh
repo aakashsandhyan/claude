@@ -27,8 +27,21 @@ TTL="${CLAUDE_CACHE_TTL:-3600}"
 BAR_WIDTH="${BAR_WIDTH:-10}"
 
 MODEL=$(jq -r '.model.display_name // "?"' <<< "$input")
-DIR=$(basename "$(jq -r '.workspace.current_dir // .cwd // "."' <<< "$input")")
+CWD=$(jq -r '.workspace.current_dir // .cwd // "."' <<< "$input")
+DIR=$(basename "$CWD")
 TRANSCRIPT=$(jq -r '.transcript_path // ""' <<< "$input")
+
+# --no-optional-locks keeps this read-only, so it cannot contend for
+# .git/index.lock on a render path. Short SHA on detached HEAD; nothing
+# outside a repo.
+LOC="$DIR"
+if BRANCH=$(git -C "$CWD" --no-optional-locks branch --show-current 2>/dev/null); then
+  if [[ -z "$BRANCH" ]]; then
+    SHA=$(git -C "$CWD" --no-optional-locks rev-parse --short HEAD 2>/dev/null)
+    [[ -n "$SHA" ]] && BRANCH="@$SHA"
+  fi
+  [[ -n "$BRANCH" ]] && LOC="$DIR ($BRANCH)"
+fi
 
 # --- context -----------------------------------------------------------------
 # Field layout has varied across Claude Code versions. Prefer the server-computed
@@ -99,4 +112,4 @@ else
   IDLE="?"; CACHE="?"
 fi
 
-printf '[%s] %s · %s · idle %s · cache %s' "$MODEL" "$DIR" "$CTX" "$IDLE" "$CACHE"
+printf '[%s] %s · %s · idle %s · cache %s' "$MODEL" "$LOC" "$CTX" "$IDLE" "$CACHE"
